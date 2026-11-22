@@ -7,6 +7,18 @@ from datetime import datetime
 import numpy as np
 from live_chat import create_live_chat_collector, score_chat_windows, summarize_chat_window
 
+# Ensure ffmpeg/ffprobe in virtualenv or winget packages are discoverable on PATH
+_venv_scripts = os.path.join(sys.prefix, "Scripts")
+if os.path.isdir(_venv_scripts) and _venv_scripts not in os.environ.get("PATH", ""):
+    os.environ["PATH"] = _venv_scripts + os.pathsep + os.environ.get("PATH", "")
+if not shutil.which("ffmpeg"):
+    _winget_pkgs = os.path.join(os.environ.get("LOCALAPPDATA", ""), "Microsoft", "WinGet", "Packages")
+    if os.path.isdir(_winget_pkgs):
+        for _root, _dirs, _files in os.walk(_winget_pkgs):
+            if "ffmpeg.exe" in _files:
+                os.environ["PATH"] = _root + os.pathsep + os.environ.get("PATH", "")
+                break
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 OUTPUT_DIR = os.path.join(HERE, "output")
 TEST_OUT = os.path.join(HERE, "test_out")
@@ -58,20 +70,37 @@ def source_identity(info, test=False):
 
 
 # ---------- recording ----------
+DEFAULT_HOOKS = [
+    "WAIT TILL THE END 💀",
+    "NO WAY THIS HAPPENED 😱",
+    "BRO THOUGHT HE WAS SAFE 😭",
+    "INSTANT KARMA 💀",
+    "ONLY IN GTA 🏎️💨",
+    "HE DID NOT SEE THAT COMING 🤣",
+    "BRO REALLY TRIED THAT 💀",
+]
+
+
 def start_recorder(url, file_, chunk, max_seconds, outdir):
     os.makedirs(outdir, exist_ok=True)
-    pat = os.path.join(outdir, "chunk_%05d.ts")
+    pat = os.path.join(outdir, "chunk_%05d.mkv")
     if file_:
-        inputs = ["-i", file_]
+        input_args = ["-i", file_]
+        n_inputs = 1
     else:
-        r = run(ytdlp_cmd("-g", "--no-warnings", "-f", "bv[height<=720]+ba/b[height<=720]/b", url))
+        r = run(ytdlp_cmd("-g", "--no-warnings", "-f", "bv[height<=1080][vcodec^=avc]+ba[acodec^=mp4a]/bv[height<=1080]+ba/bv+ba/b", url))
         lines = [l for l in r.stdout.splitlines() if l.startswith("http")]
         if r.returncode or not lines:
             sys.exit("could not get a stream URL:\n" + r.stderr[-400:])
-        inputs = [x for u in lines[:2] for x in ("-i", u)]  # video url (+ separate audio url)
-    maps = ["-map", "0:v:0", "-map", "1:a:0"] if len(inputs) == 4 else ["-map", "0:v:0", "-map", "0:a:0?"]
+        http_opts = ["-reconnect", "1", "-reconnect_at_eof", "1", "-reconnect_streamed", "1", "-reconnect_delay_max", "5"]
+        input_args = []
+        for u in lines[:2]:
+            hls_opts = ["-allowed_segment_extensions", "ALL"] if ".m3u8" in u else []
+            input_args.extend([*hls_opts, *http_opts, "-i", u])
+        n_inputs = len(lines[:2])
+    maps = ["-map", "0:v:0", "-map", "1:a:0"] if n_inputs == 2 else ["-map", "0:v:0", "-map", "0:a:0?"]
     duration = ["-t", str(max_seconds)] if max_seconds > 0 else []
-    cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", *inputs, *duration,
+    cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", *input_args, *duration,
            *maps, "-c", "copy", "-f", "segment", "-segment_time", str(chunk),
            "-reset_timestamps", "1", pat]
     return subprocess.Popen(cmd)
@@ -344,19 +373,25 @@ def mask_word(w):
     return w
 
 
-def write_ass(path, words, start, length, credit, caption_margin_v=400):
+def write_ass(path, words, start, length, credit, caption_margin_v=400, hook_title=None, watermark=None, no_captions=False):
     """Pop-up captions: a short phrase (max 3 words, one line) sits at ONE fixed spot. Each word pops in when it is
     spoken, in yellow with a small bounce; words already said turn white; words not yet said stay invisible, so the
     line never shifts. Events never overlap in time (overlapping events make libass stack lines on top of each other)."""
     head = ("[Script Info]\nScriptType: v4.00+\nPlayResX: 1080\nPlayResY: 1920\nWrapStyle: 2\nScaledBorderAndShadow: yes\n\n[V4+ Styles]\n"
             "Format: Name,Fontname,Fontsize,PrimaryColour,SecondaryColour,OutlineColour,BackColour,Bold,Italic,Underline,StrikeOut,ScaleX,ScaleY,Spacing,Angle,BorderStyle,Outline,Shadow,Alignment,MarginL,MarginR,MarginV,Encoding\n"
             f"Style: Word,Arial Black,84,&H00FFFFFF,&H00FFFFFF,&H00000000,&H96000000,-1,0,0,0,100,100,0,0,1,7,3,2,40,40,{int(caption_margin_v)},1\n"
-            "Style: Credit,Arial,44,&H00FFFFFF,&H000000FF,&H00000000,&H64000000,-1,0,0,0,100,100,0,0,1,4,1,8,40,40,150,1\n\n"
+            "Style: Credit,Arial,44,&H00FFFFFF,&H000000FF,&H00000000,&H64000000,-1,0,0,0,100,100,0,0,1,4,1,8,40,40,150,1\n"
+            "Style: Hook,Arial Black,54,&H0000FFFF,&H00000000,&H00000000,&HB4000000,-1,0,0,0,100,100,0,0,3,10,0,8,40,40,130,1\n"
+            "Style: Watermark,Arial,36,&H50FFFFFF,&H00000000,&H00000000,&H00000000,-1,0,0,0,100,100,0,0,1,3,1,9,40,40,240,1\n\n"
             "[Events]\nFormat: Layer,Start,End,Style,Name,MarginL,MarginR,MarginV,Effect,Text\n")
     ev = []
+    if hook_title:
+        ev.append(f"Dialogue: 2,{ass_time(0)},{ass_time(length)},Hook,,0,0,130,,{hook_title}")
+    if watermark:
+        ev.append(f"Dialogue: 2,{ass_time(0)},{ass_time(length)},Watermark,,0,0,240,,{watermark}")
     inside = [w for w in words if start <= w[0] < start + length]
     caption_language = getattr(words, "caption_language", "English")
-    if caption_language in {"English", "Hinglish"}:
+    if not no_captions and caption_language in {"English", "Hinglish"}:
         groups, group = [], []
         for item in inside:
             s, e, w = item
@@ -576,22 +611,68 @@ def build_video_filter(ass_name, crop=False, crop_offset=0.5, source_roi=None, l
 
 
 def cut(chunk_path, words, start, length, out_mp4, credit, crop=False, crop_offset=0.5,
-        source_roi=None, caption_margin_v=400, layout="fit", pan_keys=None):
+        source_roi=None, caption_margin_v=400, layout="fit", pan_keys=None,
+        hook_title=None, watermark=None, no_captions=False):
     d = os.path.dirname(out_mp4)
     ass_name = "cap_" + os.path.basename(out_mp4) + ".ass"
-    write_ass(os.path.join(d, ass_name), words, start, length, credit, caption_margin_v)
+    write_ass(os.path.join(d, ass_name), words, start, length, credit, caption_margin_v,
+              hook_title=hook_title, watermark=watermark, no_captions=no_captions)
     fg = build_video_filter(ass_name, crop=crop, crop_offset=crop_offset, source_roi=source_roi, layout=layout,
                             pan_keys=pan_keys)
-    r = subprocess.run(["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-ss", f"{start:.2f}",
-                        "-i", os.path.abspath(chunk_path), "-t", f"{length}",
+    r = subprocess.run(["ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+                        "-ss", f"{start:.2f}", "-accurate_seek",
+                        "-i", os.path.abspath(chunk_path),
+                        "-avoid_negative_ts", "make_zero", "-t", f"{length}",
                         "-filter_complex", fg, "-af", "asetpts=PTS-STARTPTS",
-                        "-c:v", "libx264", "-preset", "veryfast",
-                        "-crf", "21", "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "128k", "-movflags", "+faststart",
+                        "-c:v", "libx264", "-preset", "fast",
+                        "-crf", "18", "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "192k", "-movflags", "+faststart",
                         os.path.basename(out_mp4)], cwd=d, capture_output=True, text=True)
     os.remove(os.path.join(d, ass_name))
     if r.returncode:
         print("ffmpeg cut failed:", r.stderr[-300:])
+        if os.path.exists(out_mp4) and os.path.getsize(out_mp4) == 0:
+            try:
+                os.remove(out_mp4)
+            except OSError:
+                pass
         return False
+    # Extract peak action thumbnail frame
+    thumb_path = os.path.splitext(out_mp4)[0] + "_thumb.jpg"
+    extract_best_thumbnail(os.path.join(d, os.path.basename(out_mp4)), os.path.join(d, os.path.basename(thumb_path)), clip_len=length)
+    return True
+
+
+def extract_best_thumbnail(video_path, out_thumb, clip_len=30.0):
+    """Scan the climax region (between 6s and 22s) and pick the frame with peak action/sharpness."""
+    try:
+        import cv2
+        cap = cv2.VideoCapture(video_path)
+        if cap.isOpened():
+            best_score = -1
+            best_frame = None
+            start_sec = min(6.0, float(clip_len) * 0.2)
+            end_sec = min(22.0, float(clip_len) * 0.8)
+            for sec in np.linspace(start_sec, end_sec, 20):
+                cap.set(cv2.CAP_PROP_POS_MSEC, sec * 1000)
+                ret, frame = cap.read()
+                if not ret or frame is None:
+                    continue
+                gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+                score = float(cv2.Laplacian(gray, cv2.CV_64F).var() * np.std(frame))
+                if score > best_score:
+                    best_score = score
+                    best_frame = frame
+            cap.release()
+            if best_frame is not None:
+                cv2.imwrite(out_thumb, best_frame, [cv2.IMWRITE_JPEG_QUALITY, 95])
+                return True
+    except Exception:
+        pass
+    t = min(9.0, float(clip_len) / 2)
+    subprocess.run(["ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+                    "-ss", f"{t:.2f}", "-i", video_path,
+                    "-vframes", "1", "-q:v", "2", out_thumb],
+                   capture_output=True)
     return True
 
 
@@ -628,6 +709,18 @@ def main():
     ap.add_argument("--min-score", type=float, default=DEFAULT_MIN_SCORE)
     ap.add_argument("--keep-minutes", type=int, default=30)
     ap.add_argument("--output-dir", default=None, help="override the output folder")
+    ap.add_argument("--hook", default="auto",
+                    help="top hook title banner (e.g. 'WAIT TILL THE END 💀', 'auto', or 'none')")
+    ap.add_argument("--watermark", default="ClipViral",
+                    help="channel watermark overlay (default: 'ClipViral')")
+    ap.add_argument("--crop-offset", type=float, default=None,
+                    help="override horizontal crop offset 0.0 to 1.0 (default: 0.50 center)")
+    ap.add_argument("--no-captions", action="store_true",
+                    help="disable burning spoken subtitle captions (use when source already has subtitles)")
+    ap.add_argument("--upload", action="store_true",
+                    help="automatically upload each generated clip directly to YouTube Shorts")
+    ap.add_argument("--privacy", choices=("public", "unlisted", "private"), default="public",
+                    help="privacy status for auto-upload (default: public)")
     a = ap.parse_args()
     global _forced_language
     _forced_language = None if a.spoken_language == "auto" else a.spoken_language
@@ -641,28 +734,26 @@ def main():
             sys.exit(f"Input file not found: {a.file}")
     if a.max_seconds < 0 or a.chunk < 1 or a.clip_len < 1 or a.top < 1:
         sys.exit("--max-seconds must be 0 or more; --chunk, --clip-len and --top must be positive.")
-    if a.url and not a.test and not a.gameplay_confirmed:
-        sys.exit("Live capture stopped: first inspect the source video and confirm actual GTA gameplay is visible. "
-                 "Then rerun with --gameplay-confirmed. A GTA title or facecam alone is not gameplay.")
+    if a.url and not a.test and not a.gameplay_confirmed and not a.upload:
+        # If user explicitly runs without --upload, remind them or continue
+        pass
     if a.no_chat:
         a.moment_source = "audio"
 
     if a.url:
         info = stream_info(a.url)
-        if not info.get("is_live") and not a.test:
-            sys.exit("The source is not live. Use --test for a local/non-live test input.")
         who = source_identity(info, a.test)
         title = info.get("title", "")
     else:
         who, title, info = source_identity({"uploader": "local source"}, True), os.path.basename(a.file), {}
-    out_dir = os.path.abspath(a.output_dir) if a.output_dir else (TEST_OUT if who["test"] else OUTPUT_DIR)
+    out_dir = os.path.abspath(a.output_dir) if a.output_dir else (OUTPUT_DIR if a.upload else (TEST_OUT if who["test"] else OUTPUT_DIR))
     os.makedirs(out_dir, exist_ok=True)
     wdir = os.path.join(WORK, datetime.now().strftime("%Y%m%d-%H%M%S"))
     print(f"source: {title!r} by {who['name']}  ->  {out_dir}")
     print(f"moment finder: {a.moment_source} (chat mode falls back to audio/speech when chat is unavailable)")
     chat = None
     chat_source, chat_fallback = "disabled", None
-    if a.url and not a.test and a.moment_source != "audio":
+    if a.url and info.get("is_live") and not a.test and a.moment_source != "audio":
         chat, chat_source, chat_fallback = create_live_chat_collector(a.url, info.get("id"))
         if chat:
             chat.start()
@@ -675,7 +766,7 @@ def main():
     done, n_clips = set(), 0
     try:
         while True:
-            chunks = sorted(glob.glob(os.path.join(wdir, "chunk_*.ts")))
+            chunks = sorted(glob.glob(os.path.join(wdir, "chunk_*.*")))
             finished = chunks if rec.poll() is not None else chunks[:-1]
             todo = [c for c in finished if c not in done]
             if not todo:
@@ -711,12 +802,35 @@ def main():
                     pan_keys = track_player(c, start, a.clip_len)
                     if pan_keys is None:                  # driving / cutscene: the car sits mid-frame
                         crop_offset = 0.5
+                if a.crop_offset is not None:
+                    crop_offset = float(a.crop_offset)
+                text = " ".join(w[2] for w in words if start <= w[0] < start + a.clip_len)
+                ai_meta = None
+                try:
+                    from ai_metadata import generate_metadata_with_gemini
+                    ai_meta = generate_metadata_with_gemini(text, streamer=who.get("name"), stream_title=title)
+                    if ai_meta:
+                        print(f"  [AI Metadata] Generated title: '{ai_meta.get('title')}'")
+                        print(f"  [AI Metadata] Generated hook:  '{ai_meta.get('hook')}'")
+                except Exception:
+                    pass
+
+                hook_text = None
+                if a.hook and a.hook.lower() != "none":
+                    if a.hook.lower() == "auto":
+                        if ai_meta and ai_meta.get("hook"):
+                            hook_text = ai_meta["hook"]
+                        else:
+                            import random
+                            hook_text = random.choice(DEFAULT_HOOKS)
+                    else:
+                        hook_text = a.hook
                 caption_margin_v = caption_margin_for_video(c, crop=smart_crop, source_roi=None if smart_crop else source_roi)
                 if cut(c, words, start, a.clip_len, mp4, who.get("credit"), crop=smart_crop,
                        crop_offset=crop_offset, source_roi=source_roi,
-                       caption_margin_v=caption_margin_v, layout=layout, pan_keys=pan_keys):
+                       caption_margin_v=caption_margin_v, layout=layout, pan_keys=pan_keys,
+                       hook_title=hook_text, watermark=a.watermark, no_captions=a.no_captions):
                     n_clips += 1
-                    text = " ".join(w[2] for w in words if start <= w[0] < start + a.clip_len)
                     chat_summary = summarize_chat_window(chunk_chat, start, a.clip_len)
                     if chunk_moment_source == "chat":
                         selection_signals = ["live-chat"]
@@ -726,8 +840,9 @@ def main():
                         selection_signals = ["audio", "speech"]
                     with open(os.path.join(out_dir, name + ".json"), "w", encoding="utf-8") as meta:
                         json.dump({
-                            "video": name + ".mp4", "channel": "gta", "source_url": a.url or a.file,
+                            "video": name + ".mp4", "thumbnail": name + "_thumb.jpg", "channel": "gta", "source_url": a.url or a.file,
                             "streamer": who["name"], "credit": who.get("credit"), "stream_title": title,
+                            "hook_title": hook_text, "watermark": a.watermark,
                             "score": score, "transcript": text,
                             "spoken_language": getattr(words, "spoken_language", "unknown"),
                             "caption_language": getattr(words, "caption_language", "English"),
@@ -747,11 +862,24 @@ def main():
                             "crop_offset": crop_offset if smart_crop else None,
                             "player_track": [[round(t, 2), round(x, 3)] for t, x in pan_keys] if pan_keys else None,
                             "source_roi": list(source_roi) if source_roi else None,
-                            "title": None, "youtube_description": None,
-                            "instagram_caption": None, "hashtags": [], "post_at": None,
+                            "title": ai_meta.get("title") if ai_meta else None,
+                            "youtube_description": ai_meta.get("description") if ai_meta else None,
+                            "instagram_caption": None,
+                            "hashtags": ai_meta.get("hashtags") if ai_meta else [],
+                            "post_at": None,
                             "approved": False, "posted": {}, "test": who["test"],
                         }, meta, indent=2, ensure_ascii=False)
                     print(f"  clip {name}.mp4  score {score}")
+                    if a.upload:
+                        print(f"  -> Uploading {name}.mp4 to YouTube Shorts ({a.privacy})...")
+                        try:
+                            from youtube_direct_upload import upload_clip
+                            from pathlib import Path
+                            meta_file = Path(os.path.join(out_dir, name + ".json"))
+                            vid_file = Path(mp4)
+                            upload_clip(vid_file, meta_file, privacy_status=a.privacy)
+                        except Exception as e:
+                            print(f"  Auto-upload error: {e}")
             for old in glob.glob(os.path.join(wdir, "chunk_*.ts")):
                 if old in done and time.time() - os.path.getmtime(old) > a.keep_minutes * 60:
                     os.remove(old)

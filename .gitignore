@@ -18,3 +18,7 @@ output/
 private/
 
 models/person_yolox_s_2022nov.onnx
+
+.venv/
+client_secrets.json
+youtube_token.json
